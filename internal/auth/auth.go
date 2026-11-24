@@ -71,6 +71,7 @@ type Auth struct {
 	i18n         *i18n.I18n
 	oauthCfgs    map[int]oauth2.Config
 	verifiers    map[int]*oidc.IDTokenVerifier
+	providers    map[int]*oidc.Provider
 	redirectURLs map[int]func() (string, error)
 	sess         *simplesessions.Manager
 	logger       *logf.Logger
@@ -82,6 +83,7 @@ type Auth struct {
 func New(cfg Config, i18n *i18n.I18n, rd *redis.Client, logger *logf.Logger, dialControl ssrf.Control) (*Auth, error) {
 	oauthCfgs := make(map[int]oauth2.Config)
 	verifiers := make(map[int]*oidc.IDTokenVerifier)
+	providers := make(map[int]*oidc.Provider)
 	redirectURLs := make(map[int]func() (string, error))
 
 	oidcClient := newOIDCClient(dialControl)
@@ -104,6 +106,7 @@ func New(cfg Config, i18n *i18n.I18n, rd *redis.Client, logger *logf.Logger, dia
 
 		oauthCfgs[provider.ID] = oauthCfg
 		verifiers[provider.ID] = verifier
+		providers[provider.ID] = oidcProv
 		redirectURLs[provider.ID] = provider.RedirectURL
 	}
 
@@ -136,6 +139,7 @@ func New(cfg Config, i18n *i18n.I18n, rd *redis.Client, logger *logf.Logger, dia
 		i18n:         i18n,
 		oauthCfgs:    oauthCfgs,
 		verifiers:    verifiers,
+		providers:    providers,
 		redirectURLs: redirectURLs,
 		sess:         sess,
 		logger:       logger,
@@ -161,6 +165,7 @@ func (a *Auth) Reload(cfg Config) error {
 
 	oauthCfgs := make(map[int]oauth2.Config)
 	verifiers := make(map[int]*oidc.IDTokenVerifier)
+	providers := make(map[int]*oidc.Provider)
 	redirectURLs := make(map[int]func() (string, error))
 
 	for _, provider := range cfg.Providers {
@@ -181,12 +186,14 @@ func (a *Auth) Reload(cfg Config) error {
 
 		oauthCfgs[provider.ID] = oauthCfg
 		verifiers[provider.ID] = verifier
+		providers[provider.ID] = oidcProv
 		redirectURLs[provider.ID] = provider.RedirectURL
 	}
 
 	a.cfg.Providers = cfg.Providers
 	a.oauthCfgs = oauthCfgs
 	a.verifiers = verifiers
+	a.providers = providers
 	a.redirectURLs = redirectURLs
 
 	return nil
@@ -270,9 +277,23 @@ func (a *Auth) ExchangeOIDCToken(ctx context.Context, providerID int, code strin
 		a.logger.Error("error parsing claims from oidc id_token", "provider_id", providerID, "error", err)
 		return "", OIDCclaim{}, errors.New("error getting user from OIDC")
 	}
+	// Some providers omit email from the ID token but expose it through UserInfo.
+	// Only accept profile data for the subject of the already verified ID token.
 	if strings.TrimSpace(claims.Email) == "" {
-		a.logger.Error("oidc id_token has no email, check that the provider sends the email claim", "provider_id", providerID)
-		return "", OIDCclaim{}, errors.New("oidc id_token has no email")
+		provider := a.providers[providerID]
+		if provider == nil {
+			a.logger.Error("oidc id_token has no email and the provider is unavailable for userinfo", "provider_id", providerID)
+			return "", OIDCclaim{}, errors.New("oidc id_token has no email")
+		}
+		info, err := provider.UserInfo(ctx, oauth2.StaticTokenSource(tk))
+		if err != nil {
+			a.logger.Warn("oidc userinfo lookup failed", "provider_id", providerID)
+			return "", OIDCclaim{}, errors.New("oidc userinfo lookup failed")
+		}
+		if err := mergeUserInfo(&claims, info); err != nil {
+			a.logger.Warn("oidc userinfo email unavailable or subject mismatch", "provider_id", providerID)
+			return "", OIDCclaim{}, err
+		}
 	}
 	a.logger.Debug("oidc token exchange successful", "provider_id", providerID, "email", claims.Email, "email_verified", claims.EmailVerified)
 	return rawIDTk, claims, nil
@@ -571,5 +592,19 @@ func simpleSessSetCookieCB(c *http.Cookie, w any) error {
 	fc.SetSameSite(fasthttp.CookieSameSite(c.SameSite))
 
 	req.RequestCtx.Response.Header.SetCookie(fc)
+	return nil
+}
+
+// mergeUserInfo prevents a profile response from substituting another identity.
+func mergeUserInfo(claims *OIDCclaim, info *oidc.UserInfo) error {
+	if claims.Sub == "" || info == nil || info.Subject != claims.Sub {
+		return errors.New("oidc userinfo subject mismatch")
+	}
+	email := strings.TrimSpace(info.Email)
+	if email == "" {
+		return errors.New("oidc provider did not supply an email address")
+	}
+	claims.Email = email
+	claims.EmailVerified = info.EmailVerified
 	return nil
 }
